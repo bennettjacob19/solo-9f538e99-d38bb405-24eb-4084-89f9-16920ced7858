@@ -17,6 +17,15 @@ Design summary
 * While a restore holds a live lease, writes are rejected with
   ``RestoreInProgress``.  An expired lease (crashed restorer) is reclaimed, and
   a restorer that lost its lease aborts instead of overwriting newer state.
+* Quarantines are keyed by *target address*, not by service.  They live in
+  their own table, outside the versioned directory, so a restore of an older
+  backup can never drop a quarantine and re-expose a failed address.  A
+  quarantine change publishes a new directory version (same rows) and is
+  committed in the same transaction as the change itself, so a reader pins a
+  version together with the quarantine set that was current at that instant.
+  Whether a service is blocked is decided at read time from its *current*
+  address, so re-pointing a service clears the old address's effect and
+  pointing it at a quarantined address makes it immediately unavailable.
 """
 
 from __future__ import annotations
@@ -39,6 +48,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .errors import (
+    AddressNotQuarantined,
+    AddressQuarantined,
     BackupNameTaken,
     BackupValidationError,
     ConflictError,
@@ -50,7 +61,8 @@ from .errors import (
     RestoreInProgress,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SCHEMA_VERSION_V1 = 1
 BACKUP_FORMAT = "svcdir-backup-v1"
 MAX_SERVICES = 5000
 MAX_ADDRESS_LENGTH = 512
@@ -162,21 +174,32 @@ class _PinnedView:
         self._store = store
         self.version = store._current_version(conn)
         self.restore = store._restore_summary(conn)
+        # One read transaction => one snapshot, so the quarantine set is
+        # exactly the one that was published with ``self.version``.
+        self._quarantined: set[str] = store._quarantined_addresses(conn)
 
     @property
     def restore_in_progress(self) -> bool:
         return self.restore.get("state") == "restoring"
 
+    def _quarantine_list(self) -> list[dict]:
+        return self._store._quarantine_summary(self._conn, self._quarantined)
+
     def resolve(self, name: str | None = None) -> dict:
         service = validate_service_name(name) if name is not None else None
         if service is None:
             rows = self._store._entries(self._conn, self.version)
+            services = {
+                svc: addr for svc, addr in rows if addr not in self._quarantined
+            }
             return {
                 "version": self.version,
-                "count": len(rows),
-                "services": dict(rows),
+                "count": len(services),
+                "services": services,
                 "restore_in_progress": self.restore_in_progress,
                 "restore": self.restore,
+                "quarantined_count": len(self._quarantined),
+                "quarantines": self._quarantine_list(),
             }
         row = self._conn.execute(
             "SELECT address FROM entries WHERE version_id=? AND service=?",
@@ -184,10 +207,13 @@ class _PinnedView:
         ).fetchone()
         if row is None:
             raise NotFoundError(f"未知服务: {service}")
+        address = str(row["address"])
+        if address in self._quarantined:
+            raise AddressQuarantined(service, address)
         return {
             "version": self.version,
             "name": service,
-            "address": str(row["address"]),
+            "address": address,
             "restore_in_progress": self.restore_in_progress,
             "restore": self.restore,
         }
@@ -295,10 +321,16 @@ class DirectoryStore:
         ).fetchone()
         if has_meta:
             row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-            if row is None or str(row["value"]) != str(SCHEMA_VERSION):
+            actual = None if row is None else str(row["value"])
+            if actual == str(SCHEMA_VERSION_V1):
+                # v1 -> v2: quarantines moved out of the versioned directory.
+                # The set starts empty; nothing else changes.
+                self._create_quarantine_table(conn)
+                self._meta_set(conn, "schema_version", str(SCHEMA_VERSION))
+                return
+            if actual != str(SCHEMA_VERSION):
                 raise RuntimeError(
-                    f"数据库 schema 版本不兼容：期望 {SCHEMA_VERSION}，实际 "
-                    f"{None if row is None else row['value']}"
+                    f"数据库 schema 版本不兼容：期望 {SCHEMA_VERSION}，实际 {actual}"
                 )
             return
         conn.execute(
@@ -338,6 +370,7 @@ class DirectoryStore:
             )
             """
         )
+        self._create_quarantine_table(conn)
         now = _utc_now_iso()
         cur = conn.execute(
             "INSERT INTO versions(created_at, kind, note) VALUES (?, 'initial', '初始空目录')",
@@ -347,6 +380,18 @@ class DirectoryStore:
         self._meta_set(conn, "schema_version", str(SCHEMA_VERSION))
         self._meta_set(conn, "current_version", str(initial_version))
         self._meta_set(conn, "restore_state", "idle")
+
+    @staticmethod
+    def _create_quarantine_table(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS quarantines (
+                address TEXT PRIMARY KEY,
+                reason TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
 
     # -- meta helpers -----------------------------------------------------
 
@@ -367,8 +412,9 @@ class DirectoryStore:
     def _meta_del(conn: sqlite3.Connection, key: str) -> None:
         conn.execute("DELETE FROM meta WHERE key=?", (key,))
 
-    def _current_version(self, conn: sqlite3.Connection) -> int:
-        raw = self._meta_get(conn, "current_version")
+    @staticmethod
+    def _current_version(conn: sqlite3.Connection) -> int:
+        raw = DirectoryStore._meta_get(conn, "current_version")
         try:
             return int(raw)
         except (TypeError, ValueError):
@@ -514,6 +560,47 @@ class DirectoryStore:
         ).fetchall()
         return tuple((str(r["service"]), str(r["address"])) for r in rows)
 
+    # -- quarantine helpers -----------------------------------------------
+
+    @staticmethod
+    def _quarantined_addresses(conn: sqlite3.Connection) -> set[str]:
+        rows = conn.execute("SELECT address FROM quarantines").fetchall()
+        return {str(r["address"]) for r in rows}
+
+    @staticmethod
+    def _quarantine_summary(
+        conn: sqlite3.Connection, quarantined: set[str] | None = None
+    ) -> list[dict]:
+        """Quarantined addresses with the services currently pointing at them."""
+        addresses = (
+            DirectoryStore._quarantined_addresses(conn)
+            if quarantined is None
+            else quarantined
+        )
+        if not addresses:
+            return []
+        rows = conn.execute(
+            "SELECT service, address FROM entries WHERE version_id=?",
+            (DirectoryStore._current_version(conn),),
+        ).fetchall()
+        affected: dict[str, list[str]] = {address: [] for address in addresses}
+        for row in rows:
+            address = str(row["address"])
+            if address in affected:
+                affected[address].append(str(row["service"]))
+        details = conn.execute(
+            "SELECT address, reason, created_at FROM quarantines ORDER BY created_at, address"
+        ).fetchall()
+        return [
+            {
+                "address": str(r["address"]),
+                "reason": str(r["reason"]),
+                "created_at": str(r["created_at"]),
+                "services": sorted(affected[str(r["address"])]),
+            }
+            for r in details
+        ]
+
     def _fire(self, name: str, payload: dict) -> None:
         hook = self._hooks.get(name)
         if hook is not None:
@@ -551,6 +638,8 @@ class DirectoryStore:
             version = self._current_version(conn)
             rows = self._entries(conn, version)
             restore = self._restore_summary(conn)
+            quarantined = self._quarantined_addresses(conn)
+            quarantines = self._quarantine_summary(conn, quarantined)
             backups = [
                 {
                     "name": str(r["name"]),
@@ -568,8 +657,15 @@ class DirectoryStore:
             "version": version,
             "count": len(rows),
             "services": [
-                {"service": s, "address": a} for s, a in rows
+                {
+                    "service": s,
+                    "address": a,
+                    "quarantined": a in quarantined,
+                }
+                for s, a in rows
             ],
+            "quarantines": quarantines,
+            "quarantined_count": len(quarantined),
             "restore": restore,
             "backups": backups,
         }
@@ -671,6 +767,90 @@ class DirectoryStore:
             "created_at": created_at,
             "digest": digest,
             "entry_count": len(entries),
+        }
+
+    # -- quarantine writes -------------------------------------------------
+
+    def quarantine(self, address: Any, reason: Any = "") -> dict:
+        """Block every service that currently points at ``address``.
+
+        Publishes a new version (same rows) in the same transaction, so the
+        change becomes visible to new readers at one commit point.  A query
+        that began earlier keeps its own snapshot and finishes on the old
+        state.
+        """
+        addr = validate_address(address)
+        clean_reason = _clean_note(reason)
+        self._ensure_ready()
+        with self._txn(write=True) as conn:
+            self._require_writable(conn)
+            previous = self._current_version(conn)
+            if conn.execute("SELECT 1 FROM quarantines WHERE address=?", (addr,)).fetchone():
+                raise ConflictError(f"目标地址已被隔离: {addr}", code="already_quarantined")
+            affected = sorted(
+                str(r["service"])
+                for r in conn.execute(
+                    "SELECT service FROM entries WHERE version_id=? AND address=?",
+                    (previous, addr),
+                ).fetchall()
+            )
+            conn.execute(
+                "INSERT INTO quarantines(address, reason, created_at) VALUES (?, ?, ?)",
+                (addr, clean_reason, _utc_now_iso()),
+            )
+            new_version = self._create_version(
+                conn,
+                previous,
+                "quarantine",
+                f"隔离 {addr}" + (f"：{clean_reason}" if clean_reason else ""),
+            )
+            self._set_current(conn, new_version)
+        self._fire(
+            "after_quarantine_change",
+            {"action": "quarantine", "address": addr, "affected": affected,
+             "version": new_version},
+        )
+        return {
+            "version": new_version,
+            "previous_version": previous,
+            "address": addr,
+            "reason": clean_reason,
+            "affected": affected,
+            "quarantined": True,
+        }
+
+    def unquarantine(self, address: Any) -> dict:
+        """Lift a quarantine; only services still pointing there recover."""
+        addr = validate_address(address)
+        self._ensure_ready()
+        with self._txn(write=True) as conn:
+            self._require_writable(conn)
+            previous = self._current_version(conn)
+            if conn.execute("SELECT 1 FROM quarantines WHERE address=?", (addr,)).fetchone() is None:
+                raise AddressNotQuarantined(f"目标地址未被隔离: {addr}")
+            restored = sorted(
+                str(r["service"])
+                for r in conn.execute(
+                    "SELECT service FROM entries WHERE version_id=? AND address=?",
+                    (previous, addr),
+                ).fetchall()
+            )
+            conn.execute("DELETE FROM quarantines WHERE address=?", (addr,))
+            new_version = self._create_version(
+                conn, previous, "unquarantine", f"解除隔离 {addr}"
+            )
+            self._set_current(conn, new_version)
+        self._fire(
+            "after_quarantine_change",
+            {"action": "unquarantine", "address": addr, "restored": restored,
+             "version": new_version},
+        )
+        return {
+            "version": new_version,
+            "previous_version": previous,
+            "address": addr,
+            "restored": restored,
+            "quarantined": False,
         }
 
     # -- backup validation ------------------------------------------------

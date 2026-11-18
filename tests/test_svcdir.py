@@ -781,3 +781,300 @@ def test_html_escapes_hostile_names(client):
     resp = client.get("/")
     assert resp.headers["X-Content-Type-Options"] == "nosniff"
     assert "script-src 'self'" in resp.headers["Content-Security-Policy"]
+
+
+# ---------------------------------------------------------------------------
+# Address quarantine
+
+
+from svcdir.errors import AddressNotQuarantined, AddressQuarantined  # noqa: E402
+
+
+def test_quarantine_blocks_single_and_whole_directory(store):
+    seed(store, {"a": "10.0.0.1:80", "b": "10.0.0.2:80"})
+    before = store.resolve()
+    result = store.quarantine("10.0.0.1:80", "host down")
+    assert result["affected"] == ["a"]
+    assert result["version"] > before["version"]
+
+    with pytest.raises(AddressQuarantined) as excinfo:
+        store.resolve("a")
+    assert excinfo.value.address == "10.0.0.1:80"
+    assert excinfo.value.status_code == 503
+
+    directory = store.resolve()
+    assert directory["services"] == {"b": "10.0.0.2:80"}
+    assert directory["count"] == 1
+    assert [q["address"] for q in directory["quarantines"]] == ["10.0.0.1:80"]
+    assert directory["quarantines"][0]["services"] == ["a"]
+    # The service still exists in the directory; it is just unavailable.
+    assert store.resolve("b")["address"] == "10.0.0.2:80"
+
+
+def test_quarantine_publishes_new_version(store):
+    seed(store, {"a": "1"})
+    v1 = store.resolve()["version"]
+    q = store.quarantine("1")
+    v2 = store.resolve()["version"]
+    u = store.unquarantine("1")
+    v3 = store.resolve()["version"]
+    assert v1 < q["version"] == v2 < u["version"] == v3
+    with sqlite3.connect(store.db_path) as conn:
+        kinds = dict(conn.execute("SELECT id, kind FROM versions").fetchall())
+    assert kinds[q["version"]] == "quarantine"
+    assert kinds[u["version"]] == "unquarantine"
+
+
+def test_unquarantine_restores_only_currently_matching_services(store):
+    seed(store, {"a": "1", "b": "2"})
+    store.quarantine("1")
+    store.upsert("a", "3")           # re-pointed: no longer affected by "1"
+    result = store.unquarantine("1")
+    assert result["restored"] == []  # nothing points at "1" any more
+    assert store.resolve("a")["address"] == "3"
+    assert store.resolve("b")["address"] == "2"
+    with pytest.raises(AddressNotQuarantined):
+        store.unquarantine("1")
+
+
+def test_repointing_a_service_escapes_the_old_address_quarantine(store):
+    seed(store, {"a": "bad:1"})
+    store.quarantine("bad:1")
+    with pytest.raises(AddressQuarantined):
+        store.resolve("a")
+    store.upsert("a", "good:1")
+    assert store.resolve("a")["address"] == "good:1"
+    assert store.resolve()["services"] == {"a": "good:1"}
+    # Re-pointing back is blocked again immediately.
+    store.upsert("a", "bad:1")
+    with pytest.raises(AddressQuarantined):
+        store.resolve("a")
+
+
+def test_new_service_pointing_at_quarantined_address_is_blocked(store):
+    store.quarantine("bad:1")
+    store.upsert("new", "bad:1")
+    with pytest.raises(AddressQuarantined):
+        store.resolve("new")
+    assert store.resolve()["services"] == {}
+    # Quarantining an address with no services is allowed and still recorded.
+    store.quarantine("unused:1")
+    assert "unused:1" in {q["address"] for q in store.resolve()["quarantines"]}
+
+
+def test_restore_does_not_resurrect_a_quarantine(store):
+    seed(store, {"a": "bad:1", "b": "2"})
+    store.create_backup("healthy")          # backup taken before quarantine
+    store.upsert("a", "good:1")
+    store.quarantine("bad:1")
+    store.upsert("b", "3")
+    store.restore_backup("healthy")          # re-exposes the failed address
+    with pytest.raises(AddressQuarantined):
+        store.resolve("a")
+    assert store.resolve()["services"] == {"b": "2"}
+    assert [q["address"] for q in store.resolve()["quarantines"]] == ["bad:1"]
+
+
+def test_failed_validation_keeps_quarantine_state(store):
+    seed(store, {"a": "1", "b": "2"})
+    backup = store.create_backup("snap")
+    store.quarantine("1")
+    store.upsert("b", "live")
+    before = store.resolve()
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE entries SET address='tampered' WHERE version_id=? AND service='b'",
+            (backup["version"],),
+        )
+    with pytest.raises(BackupValidationError):
+        store.restore_backup("snap")
+    after = store.resolve()
+    assert after["services"] == before["services"] == {"b": "live"}
+    assert after["version"] == before["version"]
+    assert [q["address"] for q in after["quarantines"]] == ["1"]
+    with pytest.raises(AddressQuarantined):
+        store.resolve("a")
+
+
+def test_quarantine_survives_restart(tmp_path):
+    db = tmp_path / "dir.sqlite3"
+    store = DirectoryStore(db)
+    store.upsert("a", "1")
+    store.quarantine("1")
+    restarted = DirectoryStore(db)
+    with pytest.raises(AddressQuarantined):
+        restarted.resolve("a")
+    assert restarted.resolve()["quarantines"][0]["address"] == "1"
+    restarted.unquarantine("1")
+    assert restarted.resolve("a")["address"] == "1"
+
+
+def test_quarantine_rejected_while_restore_in_progress(store):
+    seed(store, {"a": "1"})
+    store.create_backup("snap")
+    gate = BlockingHooks().install(store, "validated")
+    t = threading.Thread(target=store.restore_backup, args=("snap",))
+    t.start()
+    assert gate.reached.wait(10)
+    with pytest.raises(RestoreInProgress):
+        store.quarantine("1")
+    with pytest.raises(RestoreInProgress):
+        store.unquarantine("1")
+    gate.release.set()
+    t.join(10)
+
+
+def test_query_started_before_quarantine_uses_one_state(store):
+    seed(store, {"a": "1", "b": "2"})
+
+    with store.read_view() as view:      # request accepted, snapshot pinned
+        first = view.resolve()
+        store.quarantine("1")            # committed while the query runs
+        second = view.resolve()
+        single = view.resolve("a")
+    assert first["services"] == second["services"] == {"a": "1", "b": "2"}
+    assert single["address"] == "1"
+    assert first["version"] == second["version"] == single["version"]
+    assert first["quarantines"] == []
+
+    # The next query uses the new version and its quarantine set.
+    after = store.resolve()
+    assert after["version"] > first["version"]
+    assert after["services"] == {"b": "2"}
+    with pytest.raises(AddressQuarantined):
+        store.resolve("a")
+
+
+def test_interleaved_quarantine_and_restore_never_mixes(store):
+    """Quarantine between restore validation and switch must still hold."""
+    seed(store, {"a": "1", "b": "2"})
+    store.create_backup("snap")
+    store.upsert("a", "live")
+
+    reached = threading.Event()
+    release = threading.Event()
+
+    def hook(payload):
+        # Runs inside the restore, before the switch, in another thread.
+        reached.set()
+        assert release.wait(10)
+
+    store._hooks["before_restore_switch"] = hook
+    t = threading.Thread(target=store.restore_backup, args=("snap",))
+    t.start()
+    assert reached.wait(10)
+    # The restore holds a lease, so quarantine is refused rather than mixed.
+    with pytest.raises(RestoreInProgress):
+        store.quarantine("1")
+    release.set()
+    t.join(10)
+    assert store.resolve()["services"] == {"a": "1", "b": "2"}
+    # After the restore settled, quarantine applies to the restored rows.
+    store.quarantine("1")
+    with pytest.raises(AddressQuarantined):
+        store.resolve("a")
+    assert store.resolve()["services"] == {"b": "2"}
+
+
+def test_write_failure_in_quarantine_leaves_state_intact(store, monkeypatch):
+    seed(store, {"a": "1"})
+    before = store.resolve()
+
+    def boom(conn, source_version, kind, note):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(store, "_create_version", boom)
+    with pytest.raises(Exception):
+        store.quarantine("1")
+    monkeypatch.undo()
+    after = store.resolve()
+    assert after["version"] == before["version"]
+    assert after["services"] == {"a": "1"}
+    assert after["quarantines"] == []
+    assert store.resolve("a")["address"] == "1"
+
+
+def test_http_quarantine_flow(client):
+    client.post("/api/services", json={"service": "a", "address": "10.0.0.1:80"})
+    client.post("/api/services", json={"service": "b", "address": "10.0.0.1:80"})
+    client.post("/api/services", json={"service": "c", "address": "10.0.0.2:80"})
+
+    resp = client.post("/api/quarantines", json={"address": "10.0.0.1:80", "reason": "down"})
+    assert resp.status_code == 201
+    assert resp.get_json()["affected"] == ["a", "b"]
+
+    blocked = client.get("/resolve?name=a")
+    assert blocked.status_code == 503
+    error = blocked.get_json()["error"]
+    assert error["code"] == "address_quarantined"
+    assert error["address"] == "10.0.0.1:80"
+    assert error["service"] == "a"
+    assert error["available"] is False
+
+    full = client.get("/resolve").get_json()
+    assert full["services"] == {"c": "10.0.0.2:80"}
+    assert full["quarantined_count"] == 1
+
+    state = client.get("/api/state").get_json()
+    assert [q["address"] for q in state["quarantines"]] == ["10.0.0.1:80"]
+    assert {s["service"]: s["quarantined"] for s in state["services"]} == {
+        "a": True, "b": True, "c": False,
+    }
+
+    page = client.get("/").get_data(as_text=True)
+    assert "10.0.0.1:80" in page
+    assert "已隔离" in page
+    assert "a、b" in page
+
+    released = client.delete("/api/quarantines/10.0.0.1:80")
+    assert released.status_code == 200
+    assert released.get_json()["restored"] == ["a", "b"]
+    assert client.get("/resolve?name=a").status_code == 200
+    assert client.delete("/api/quarantines/10.0.0.1:80").status_code == 404
+
+
+def test_html_quarantine_forms(client):
+    client.post("/services", data={"service": "a", "address": "1.2.3.4:5"})
+    resp = client.post("/quarantines", data={"address": "1.2.3.4:5", "reason": "故障"},
+                       follow_redirects=True)
+    assert resp.status_code == 200
+    page = resp.get_data(as_text=True)
+    assert "已隔离目标地址" in page and "受影响服务：a" in page
+    assert client.get("/resolve?name=a").status_code == 503
+
+    resp = client.post("/quarantines/1.2.3.4:5/release", follow_redirects=True)
+    assert "已解除隔离" in resp.get_data(as_text=True)
+    assert client.get("/resolve?name=a").status_code == 200
+
+
+def test_quarantine_input_validation(client):
+    assert client.post("/api/quarantines", json={"address": "  "}).status_code == 400
+    assert client.post("/api/quarantines", json={"address": "a b"}).status_code == 400
+    assert client.post("/api/quarantines", json={"address": 5}).status_code == 400
+    assert client.post("/api/quarantines", data="x").status_code == 400
+    client.post("/api/quarantines", json={"address": "1"})
+    dup = client.post("/api/quarantines", json={"address": "1"})
+    assert dup.status_code == 409
+    assert dup.get_json()["error"]["code"] == "already_quarantined"
+    assert client.delete("/api/quarantines/never").status_code == 404
+
+
+def test_schema_v1_database_is_migrated(tmp_path):
+    db = tmp_path / "old.sqlite3"
+    store = DirectoryStore(db)
+    store.upsert("a", "1")
+    store.initialize()
+    with sqlite3.connect(db) as conn:
+        conn.execute("DROP TABLE quarantines")
+        conn.execute("UPDATE meta SET value='1' WHERE key='schema_version'")
+    migrated = DirectoryStore(db)
+    migrated.initialize()
+    assert migrated.resolve("a")["address"] == "1"
+    migrated.quarantine("1")
+    with pytest.raises(AddressQuarantined):
+        migrated.resolve("a")
+    with sqlite3.connect(db) as conn:
+        version = conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()[0]
+    assert version == "2"

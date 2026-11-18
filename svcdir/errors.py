@@ -50,6 +50,32 @@ class RestoreInProgress(ConflictError):
         super().__init__(message)
 
 
+class AddressQuarantined(DirectoryError):
+    """The service's current target address is quarantined as failed."""
+
+    status_code = 503
+    code = "address_quarantined"
+
+    def __init__(self, service: str, address: str) -> None:
+        super().__init__(
+            f"服务 {service} 当前不可用：目标地址 {address} 已被隔离",
+        )
+        self.service = service
+        self.address = address
+
+    def to_dict(self) -> dict:
+        payload = super().to_dict()
+        payload["service"] = self.service
+        payload["address"] = self.address
+        payload["available"] = False
+        return payload
+
+
+class AddressNotQuarantined(NotFoundError):
+    status_code = 404
+    code = "address_not_quarantined"
+
+
 class BackupNameTaken(ConflictError):
     status_code = 409
     code = "backup_name_taken"

@@ -39,25 +39,40 @@ SVCDIR_DB=./data/directory.sqlite3 python3 -m svcdir   # 开发用内置服务�
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/` | 网页：目录、修改表单、备份列表、恢复按钮 |
-| GET | `/resolve?name=<服务名>` | 返回单个服务的地址 |
-| GET | `/resolve` | 返回整个当前目录 |
-| GET | `/api/state` | 当前版本、完整目录、恢复状态、备份列表 |
+| GET | `/resolve?name=<服务名>` | 返回单个服务的地址；地址被隔离时 503 |
+| GET | `/resolve` | 返回整个当前目录（排除指向隔离地址的服务） |
+| GET | `/api/state` | 当前版本、完整目录、隔离清单、恢复状态、备份列表 |
 | GET | `/api/backups` | 备份列表 |
 | POST | `/api/services` | `{"service": ..., "address": ..., "note": ...}` 新增/修改 |
 | DELETE | `/api/services/<名>` | 删除 |
+| POST | `/api/quarantines` | `{"address": ..., "reason": ...}` 隔离目标地址 |
+| DELETE | `/api/quarantines/<地址>` | 解除隔离 |
+| GET | `/api/quarantines` | 隔离清单及受影响服务 |
 | POST | `/api/backups` | `{"name": ...}` 创建命名备份 |
 | GET | `/api/backups/<名>/validate` | 校验备份（不修改目录） |
 | POST | `/api/backups/<名>/restore` | 从备份恢复 |
 
-浏览器表单走 `POST /services`、`/backups`、`/backups/<名>/restore`，
+浏览器表单走 `POST /services`、`POST /quarantines`、
+`POST /quarantines/<地址>/release`、`/backups`、`/backups/<名>/restore`，
 成功后 303 跳回页面并显示结果或错误。
 
 查询响应示例：
 
 ```json
 {"ok": true, "version": 6, "restore_in_progress": false,
- "name": "orders-api", "address": "10.0.0.12:8080"}
+ "name": "orders-api", "address": "10.0.0.12:8080", "available": true}
 ```
+
+指向已隔离地址的服务：
+
+```json
+{"ok": false, "error": {"code": "address_quarantined",
+ "message": "服务 orders-api 当前不可用：目标地址 10.0.0.12:8080 已被隔离",
+ "service": "orders-api", "address": "10.0.0.12:8080", "available": false}}
+```
+
+HTTP 状态码为 `503`。全目录查询 `GET /resolve` 不会列出这些服务，
+并附带 `quarantined_count`。
 
 ## 一致性与恢复语义
 
@@ -86,6 +101,30 @@ SVCDIR_DB=./data/directory.sqlite3 python3 -m svcdir   # 开发用内置服务�
 - **并发恢复。** 文件锁 + 数据库内的 `restore_state` 双重互斥，第二个恢复请求
   得到 409。
 
+## 地址隔离语义
+
+隔离针对**目标地址**而不是服务名：运维员判定某个地址故障后，所有当前指向它
+的服务立即停止解析，直到显式解除。实现要点：
+
+- **隔离清单独立于目录版本。** 隔离记录在 `quarantines` 表，不在按版本复制的
+  `entries` 里；命名备份只固定目录行。因此从任何备份恢复都不会删除隔离记录，
+  也不会重新暴露故障地址。隔离记录持久化在 SQLite 文件中，重启后仍生效。
+- **隔离状态变化推进目录版本。** 隔离 / 解除隔离都在同一个写事务里写入
+  `quarantines` 并创建一个内容相同的新版本（`kind=quarantine|unquarantine`），
+  随后发布 `current_version`。查询在单个读事务里同时读取版本行与隔离集合，
+  所以新查询立即看到变化，而已开始的查询仍在其旧快照上完整结束（不会混用新
+  隔离集合与旧目录，或反之）。
+- **按当前地址判定。** 服务是否被阻断由「当前版本里该服务的地址」与「隔离
+  集合」在读取时求交：服务改址到正常地址后即不再受旧地址隔离影响；改回隔离
+  地址或新增指向隔离地址的服务则立即不可用。
+- **解除隔离只恢复仍指向该地址的服务。** 响应里的 `restored` 是解除时实际
+  指向该地址的服务列表；期间已改址的服务不受影响。
+- **与恢复的互斥。** 隔离 / 解除隔离与普通修改一样，在恢复进行中被拒绝
+  （409）并先于恢复意图结算，所以不会出现「恢复把目录换掉、隔离却落在另一
+  版目录上」的混排；隔离失败（校验或写入失败）时事务整体回滚，原状态不变。
+- **重启。** 隔离表是普通表，随数据库文件持久化；schema 为 v2，旧 v1 数据库
+  在启动时自动补建空的 `quarantines` 表（不改变已有目录）。
+
 ## 测试
 
 ```bash
@@ -94,6 +133,21 @@ python3 -m pytest -q
 ```
 
 关键交错场景覆盖在 `tests/test_svcdir.py`：
+
+- `test_quarantine_blocks_single_and_whole_directory`
+- `test_quarantine_publishes_new_version`
+- `test_unquarantine_restores_only_currently_matching_services`
+- `test_repointing_a_service_escapes_the_old_address_quarantine`
+- `test_new_service_pointing_at_quarantined_address_is_blocked`
+- `test_restore_does_not_resurrect_a_quarantine`
+- `test_failed_validation_keeps_quarantine_state`
+- `test_quarantine_survives_restart`
+- `test_quarantine_rejected_while_restore_in_progress`
+- `test_query_started_before_quarantine_uses_one_state`
+- `test_interleaved_quarantine_and_restore_never_mixes`
+- `test_write_failure_in_quarantine_leaves_state_intact`
+- `test_http_quarantine_flow` / `test_html_quarantine_forms`
+- `test_quarantine_input_validation` / `test_schema_v1_database_is_migrated`
 
 - `test_writes_rejected_while_restore_in_progress_and_settled_before`
 - `test_query_accepted_before_switch_keeps_one_version`
@@ -116,7 +170,7 @@ python3 -m pytest -q
 
 ```
 svcdir/errors.py     错误类型 → HTTP 状态码
-svcdir/store.py      目录版本、命名备份、校验、恢复（核心逻辑）
+svcdir/store.py      目录版本、命名备份、校验、恢复、地址隔离（核心逻辑）
 svcdir/web.py        Flask 路由：网页 + API
 svcdir/templates/    页面模板
 tests/test_svcdir.py 自测（含并发交错）

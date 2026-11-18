@@ -25,15 +25,24 @@
   {% endif %}
 
   <section class="card">
-    <h2>当前目录 <span class="badge">版本 {{ state.version }} · {{ state.count }} 项</span></h2>
+    <h2>当前目录 <span class="badge">版本 {{ state.version }} · {{ state.count }} 项</span>
+      {% if state.quarantined_count %}<span class="badge bad">隔离地址 {{ state.quarantined_count }}</span>{% endif %}
+    </h2>
     {% if state.services %}
     <table>
-      <thead><tr><th>服务名</th><th>目标地址</th><th></th></tr></thead>
+      <thead><tr><th>服务名</th><th>目标地址</th><th>状态</th><th></th></tr></thead>
       <tbody>
       {% for row in state.services %}
-        <tr>
+        <tr{% if row.quarantined %} class="blocked"{% endif %}>
           <td class="mono">{{ row.service }}</td>
           <td class="mono">{{ row.address }}</td>
+          <td>
+            {% if row.quarantined %}
+            <span class="badge bad">已隔离 · 不可解析</span>
+            {% else %}
+            <span class="badge ok">可解析</span>
+            {% endif %}
+          </td>
           <td class="right">
             <form method="post" action="{{ url_for('form_delete', service=row.service) }}"
                   data-confirm="确认删除 {name}？" data-name="{{ row.service }}">
@@ -47,6 +56,48 @@
     {% else %}
     <p class="muted">目录为空。请在下方添加服务。</p>
     {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>地址隔离 <span class="badge">{{ state.quarantined_count }} 项</span></h2>
+    <p class="muted small">
+      被隔离的目标地址立即停止解析：单名查询返回不可用，全目录查询不再列出
+      指向它的服务。隔离按地址记录，不随命名备份回退。
+    </p>
+    {% if state.quarantines %}
+    <table>
+      <thead><tr><th>目标地址</th><th>受影响服务</th><th>原因</th><th>隔离时间</th><th></th></tr></thead>
+      <tbody>
+      {% for q in state.quarantines %}
+        <tr>
+          <td class="mono">{{ q.address }}</td>
+          <td class="mono">
+            {% if q.services %}{{ q.services | join('、') }}{% else %}<span class="muted">—</span>{% endif %}
+          </td>
+          <td class="small">{{ q.reason or '—' }}</td>
+          <td class="mono small">{{ q.created_at }}</td>
+          <td class="right">
+            <form method="post" action="{{ url_for('form_unquarantine', address=q.address) }}"
+                  data-confirm="解除隔离 {name}？指向该地址的服务将恢复解析。" data-name="{{ q.address }}">
+              <button type="submit">解除隔离</button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="muted">当前没有被隔离的地址。</p>
+    {% endif %}
+    <form method="post" action="{{ url_for('form_quarantine') }}" class="grid">
+      <label>要隔离的目标地址
+        <input name="address" required maxlength="512" placeholder="10.0.0.12:8080">
+      </label>
+      <label>原因（可选）
+        <input name="reason" maxlength="200" placeholder="故障工单号">
+      </label>
+      <button class="danger" type="submit">隔离地址</button>
+    </form>
   </section>
 
   <section class="card">
@@ -104,6 +155,10 @@
   <section class="card">
     <h2>查询 API</h2>
     <p class="mono small">GET /resolve?name=&lt;服务名&gt; &nbsp;·&nbsp; GET /resolve（返回整个目录）</p>
+    <p class="muted small">
+      指向已隔离地址的服务：单名查询返回 <span class="mono">503 address_quarantined</span>
+      （含 <span class="mono">available: false</span>），全目录查询会排除该服务。
+    </p>
   </section>
 </main>
 </body>

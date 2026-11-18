@@ -117,9 +117,11 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
         if "address" in result:
             body["name"] = result["name"]
             body["address"] = result["address"]
+            body["available"] = True
         else:
             body["count"] = result["count"]
             body["services"] = result["services"]
+            body["quarantined_count"] = result["quarantined_count"]
         return jsonify(body)
 
     @app.get("/api/state")
@@ -143,6 +145,26 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
     @app.delete("/api/services/<path:service>")
     def api_delete(service: str):
         return jsonify({"ok": True, **store.delete(service)})
+
+    @app.post("/api/quarantines")
+    def api_quarantine():
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            raise InputError("请求体必须是 JSON 对象")
+        result = store.quarantine(payload.get("address"), payload.get("reason", ""))
+        return jsonify({"ok": True, **result}), 201
+
+    @app.delete("/api/quarantines/<path:address>")
+    def api_unquarantine(address: str):
+        return jsonify({"ok": True, **store.unquarantine(address)})
+
+    @app.get("/api/quarantines")
+    def api_quarantines():
+        snapshot = store.snapshot()
+        return jsonify(
+            {"ok": True, "version": snapshot["version"],
+             "quarantines": snapshot["quarantines"]}
+        )
 
     @app.post("/api/backups")
     def api_create_backup():
@@ -191,6 +213,32 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
         except DirectoryError as exc:
             return _redirect_back(error=exc.message)
         return _redirect_back(message=f"已删除 {result['service']}（目录版本 {result['version']}）")
+
+    @app.post("/quarantines")
+    def form_quarantine():
+        try:
+            result = store.quarantine(
+                request.form.get("address"), request.form.get("reason", "")
+            )
+        except DirectoryError as exc:
+            return _redirect_back(error=exc.message)
+        affected = "、".join(result["affected"]) or "（当前没有服务指向该地址）"
+        return _redirect_back(
+            message=f"已隔离目标地址 {result['address']}，受影响服务：{affected}"
+                    f"（目录版本 {result['version']}）"
+        )
+
+    @app.post("/quarantines/<path:address>/release")
+    def form_unquarantine(address: str):
+        try:
+            result = store.unquarantine(address)
+        except DirectoryError as exc:
+            return _redirect_back(error=exc.message)
+        restored = "、".join(result["restored"]) or "（没有服务仍指向该地址）"
+        return _redirect_back(
+            message=f"已解除隔离 {result['address']}，恢复服务：{restored}"
+                    f"（目录版本 {result['version']}）"
+        )
 
     @app.post("/backups")
     def form_create_backup():
